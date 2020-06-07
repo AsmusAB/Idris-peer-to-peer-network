@@ -35,6 +35,6 @@ After having run the tests, and selected an ip with the following instructions o
 
 ## Contact
 You can contact us by making an **issue** on this repo, or by contacting one of the following mail addresses.\
-Frederik Vigen : [frederikvigen@gmail.com](frederikvigen@gmail.com)\
-Asmus Batram : [asmusbatram@gmail.com](asmusbatram@gmail.com)\
-Christian Weis : [christian.weis.8270@gmail.com](christian.weis.8270@gmail.com)
+Frederik Vigen : [frederikvigen@gmail.com](mailto:frederikvigen@gmail.com)\
+Asmus Batram : [asmusbatram@gmail.com](mailto:asmusbatram@gmail.com)\
+Christian Weis : [christian.weis.8270@gmail.com](mailto:christian.weis.8270@gmail.com)
