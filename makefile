@@ -2,6 +2,7 @@ IDRIS ?= idris
 PKG   := peer
 
 build:
+	  gcc c/ip.c -c -o c/ip.o
 	  $(IDRIS) --build ${PKG}.ipkg
 
 clean:
