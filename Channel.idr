@@ -1,3 +1,5 @@
+module Channel
+
 import Data.List.Views
 import System.Concurrency.Process
 import public Network.Socket

@@ -11,6 +11,9 @@ import public Network.Socket
 import Channel
 
 %access public export
+%include C "c/ip.h"
+%link C "c/ip.o"
+
 
 record Message where
        constructor MkMsg
@@ -61,7 +64,6 @@ jsonToMsgList : JSON -> Maybe (List (Maybe Message))
 jsonToMsgList (JArray msgs) = Just (map (\msg => jsonToMsg msg) msgs)
 jsonToMsgList _ = Nothing
 
--- A working implementation of the recvAll function from Network.Socket
 recAll : (sock : Socket) -> IO (Either SocketError String)
 recAll sock = recvRec sock [] 64
   where
@@ -128,16 +130,60 @@ getListOfChannel : (chan : Channel (List ty)) ->
                    ChannelCmd (ResultType (List ty)) (List ty) Unlocked Unlocked
 getListOfChannel chan = ReadOnlyCmd chan
 
+writeToChan : (chan : Channel (List ty)) -> (newList : List ty) -> ChannelCmd () (List ty) Locked Unlocked
+writeToChan chan newList = do WriteCmd chan newList
+                              PureCmd ()
+
+readFromChan : (chan : Channel (List ty)) -> ChannelCmd (ResultType (List ty)) (List ty) Unlocked Locked
+readFromChan chan = ReadCmd chan
+
+getIP : Int -> (IO String)
+getIP = foreign FFI_C "getipc" (Int -> (IO String))
+
+parseSingleIp : String -> Maybe SocketAddress
+parseSingleIp input = let parsedIp = parseIPv4 input in
+                      case parsedIp of
+                        (IPv4Addr p1 p2 p3 p4) => Just (IPv4Addr p1 p2 p3 p4)
+                        _ => Nothing
+
+getAllIps : Int -> IO (List String)
+getAllIps startingInt = do ip <- getIP startingInt
+                           if ip == "END" 
+                            then pure []
+                            else do rest <- getAllIps (startingInt + 1)
+                                    pure (ip :: rest)               
+
+printIpOptions : List (SocketAddress, Nat) -> IO ()
+printIpOptions [] = pure ()
+printIpOptions ((ip, nr) :: rest) = do putStrLn $ (show ip) ++ "(" ++ (show nr) ++ ")"
+                                       printIpOptions rest
+
+removeNothings : List (Maybe ty) -> List ty
+removeNothings [] = []
+removeNothings (Nothing :: rest) = removeNothings rest
+removeNothings (Just elem :: rest) = (elem :: removeNothings rest)
+
+selectIp : IO (SocketAddress)
+selectIp = do ips <- getAllIps 0
+              parsedIps <- pure (removeNothings (map parseSingleIp ips))
+              zippedIps <- pure (zip parsedIps [0..(length parsedIps)])
+              printIpOptions zippedIps
+              input <- getLine
+              case parseInteger input of
+                Just option => do Just addr <- pure (index' (fromIntegerNat option) parsedIps) | Nothing => selectIp
+                                  pure addr
+                Nothing => selectIp
+
 recMessages : (sock : Socket) -> (ip : SocketAddress) -> 
               (chans : PeerChannels) -> IO ()
 recMessages sock ip chans = 
   do Right jsonString <- recAll sock
-      | Left err => do putStrLn $ "Recmessages err: " ++ (show err)
+      | Left err => do if err == 0 then putStrLn $ (show ip) ++ " has lost connection" else putStrLn $ "Recmessages err: " ++ (show err)
      Just json <- pure (parse jsonString) 
       | Nothing => putStrLn "The message does not have json structure"
      Just msg <- pure (jsonToMsg json) 
       | Nothing => putStrLn "Structure of json was incorrect"
-     ok <- run (getListOfChannel (relayed chans))
+     ok <- run (readFromChan (relayed chans))
      case ok of
            (Fatal err) => 
              do putStrLn err
@@ -147,10 +193,12 @@ recMessages sock ip chans =
              case isElem (msgId msg) (map (\x => msgId x) seenmsgs) of
                (Yes prf) => 
                  do run (push (msgQueue chans) msg)
+                    run (releaseLock (relayed chans))
                     recMessages sock ip chans
                (No contra) => 
-                 do putStrLn $ (msgId msg) ++ ": " ++ (content msg)
-                    run (push (msgQueue chans) msg)
+                 do run (push (msgQueue chans) msg)
+                    putStrLn $ (msgId msg) ++ ": " ++ (content msg)
+                    run (releaseLock (relayed chans))
                     recMessages sock ip chans
 
 listenForClients : (listeningSock : Socket) -> 
@@ -160,7 +208,6 @@ listenForClients listeningSock chans =
       | Left err => do putStrLn $ "ListenForClients error: " ++ (show err)
      putStrLn $ "Socket accepted connection from: " ++ (show newIp)
      run (push (connChan chans) newSock)
-     -- Change so we are locking msgQueue
      run (lockChannel (msgQueue chans))
      seenMsgs <- run (getListOfChannel (relayed chans))
      case seenMsgs of
@@ -171,35 +218,50 @@ listenForClients listeningSock chans =
       (Correct seenMsgs) => 
         do Right ok <- send newSock ((format 1 (msgListToJson seenMsgs))) 
            | Left err => do putStrLn $ "Could not send seenMsgs, error: " ++ (show err)
-           -- Wait for ACK that newsock recieved relayed msgs
            Right str <- recAll newSock | Left err => do putStrLn $ "Failed to recieve the ACK: " ++ (show err)
            if str == "ACK" then
             do spawn (recMessages newSock newIp chans)
-               -- Release lock
                run (releaseLock (msgQueue chans))
                listenForClients listeningSock chans
-           else putStrLn $ "Did not recieve ACK but some other msg" ++ str
+           else putStrLn $ "Did not recieve ACK but some other msg" ++ str 
 
-broadcast : (msg : Message) -> (connections : List Socket) -> 
+broadcastInner : (msg : Message) -> (relayed : List Message) ->
+                 (connections : List Socket) -> IO ()
+broadcastInner msg relayed [] = pure ()
+broadcastInner msg relayed (current :: rest) = 
+  case isElem (msgId msg) (map (\x => msgId x) relayed) of
+            (Yes prf) => pure ()
+            (No contra) => 
+              do Right ok <- send current (format 1 (msgToJson msg)) 
+                  | Left err => if not (err == 32) then putStrLn $ "Could not send message: " ++ (show err) else broadcastInner msg relayed rest
+                 broadcastInner msg relayed rest
+
+broadcast : (msg : Message) -> (connChan : Channel (List Socket)) -> 
   (relayed : Channel (List Message)) -> IO ()
-broadcast msg [] relayed = 
-  do pushed <- run (push relayed msg)
-     pure ()
-broadcast msg (current :: rest) relayed = 
-  do seenMsgs <- run (getListOfChannel relayed)
-     case seenMsgs of
+broadcast msg connChan relayed = 
+  do connections <- run (readFromChan connChan)
+     case connections of 
       (Fatal x) => do putStrLn $ "Broadcast dead: " ++ x
-      (Warning x) => 
-        do putStrLn ("Failed to get seenmsgs list from channel, reason : " ++ x)
-           broadcast msg (current :: rest) relayed
-      (Correct seenMsgs) => 
-        do case isElem (msgId msg) (map (\x => msgId x) seenMsgs) of
-             (Yes prf) => pure ()
-             (No contra) => 
-               do Right ok <- send current (format 1 (msgToJson msg)) 
-                   | Left err => do putStrLn $ "Could not send message: " ++ (show err)
-                  broadcast msg rest relayed
-
+                      run (releaseLock connChan)
+                      pure ()
+      (Warning x) => do run (releaseLock connChan)
+                        broadcast msg connChan relayed
+                        pure ()
+      (Correct connections) => 
+        do ok <- run (readFromChan relayed)
+           case ok of 
+              (Fatal x) => do putStrLn $ "Broadcast dead: " ++ x
+                              run (releaseLock relayed)
+                              run (releaseLock connChan)
+                              pure ()
+              (Warning x) => do run (releaseLock relayed)
+                                run (releaseLock connChan)
+                                broadcast msg connChan relayed
+                                pure ()
+              (Correct relayedmsgs) => do broadcastInner msg relayedmsgs connections
+                                          run (releaseLock connChan)
+                                          run (writeToChan relayed (msg :: relayedmsgs))
+                                          pure () 
 
 broadcastToClients : (chans : PeerChannels) -> IO ()
 broadcastToClients chans = 
@@ -214,15 +276,8 @@ broadcastToClients chans =
            Nothing => 
              do broadcastToClients chans
            (Just msg) => 
-             do resCons <- run (getListOfChannel (connChan chans))
-                case resCons of
-                  (Fatal err) => do putStrLn $ "BroadCastToClients Dead2: " ++ err
-                  (Warning err) => 
-                    do putStrLn ("BroadCastToClientsErr2 " ++ err)
-                       broadcastToClients chans
-                  (Correct connections) => 
-                    do broadcast msg connections (relayed chans)
-                       broadcastToClients chans
+             do broadcast msg (connChan chans) (relayed chans)
+                broadcastToClients chans
 
 addSingleMsg : (input : String) -> (msgQueue : Channel (List Message)) -> (msgId : String) -> IO ()
 addSingleMsg input msgQueue msgId = do pushedOk <- run (push msgQueue (MkMsg msgId input))
@@ -239,7 +294,6 @@ repl chans oldId ip port =
      msgId <- generateMsgId ip port newId
      spawn (addSingleMsg input (msgQueue chans) msgId)
      repl chans newId ip port
-
 
 addMessagesToChan : (msgs : List (Maybe Message)) -> (relayed : Channel (List Message)) -> IO ()
 addMessagesToChan [] relayed = pure ()
@@ -281,8 +335,8 @@ connectingPeer chans mySock myIp myPort newIp newPort =
       do Push (connChan chans) newSock
          WaitForRelayedMessages newSock (relayed chans)
          PutStrLn $ "Socket is listening for connections on: " ++ (show myIp) ++ ":" ++ (show myPort)
-         RecMessages newSock newIp chans
-         ListenForNewClients mySock chans
+         RecMessages newSock newIp chans 
+         ListenForNewClients mySock chans 
          BroadcastToClients chans
          ReplStart chans myIp myPort
      else Error $ "Something went wrong : error code " ++ (show ok) 
@@ -290,7 +344,7 @@ connectingPeer chans mySock myIp myPort newIp newPort =
 run : PeerCmd res inState outState -> IO res
 run (WaitForRelayedMessages sock relayed) = waitForSeenMsgs sock relayed
 run (ListenForNewClients sock chans) = 
-  do spawn (listenForClients sock chans)
+  do spawn (listenForClients sock chans )
      pure ()
 run (BroadcastToClients chans) =
   do spawn (broadcastToClients chans)
@@ -321,13 +375,15 @@ peerStart =
      msgQueue <- makeChan (the (List Message) [])
      relayed <- makeChan (the (List Message) [])
      chans <- pure (MkPeerChans msgQueue relayed connChan)
-     ip <- pure (IPv4Addr 192 168 87 189)
+     putStrLn "Select what ip you want to use, by inputting the number in the parentheses:"
+     ip <- selectIp
      seed <- time
      port <- pure (randPort (fromInteger seed))
      ok <- bind sock (Just ip) port
      listeningCode <- listen sock
      if ok == 0 then 
-       do ipAndPort <- getLine
+       do putStrLn "Press ENTER to start a new network, or input an ip to connect to an existing network"
+          ipAndPort <- getLine
           if ipAndPort == "" then
             do run (firstPeer chans sock ip port)
           else

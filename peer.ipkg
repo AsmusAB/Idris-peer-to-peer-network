@@ -1,0 +1,6 @@
+package peer
+
+pkgs        = contrib, effects
+modules     = Peer
+            , PeerTest
+            , Channel
